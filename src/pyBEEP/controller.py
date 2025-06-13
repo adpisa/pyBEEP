@@ -207,20 +207,18 @@ class PotentiostatController:
         if pid:
             initial_target = write_list[:2]
             self.device.write_data(REG_WRITE_ADDR_PID, [CMD['PID_START']] + initial_target.tolist())
-            print('PID Activated')
 
         # Send and collect data
         i = 0
         params['transmission_st'] = time_ns()
         post_read_attempts = 0
-        while post_read_attempts < 32:
+        while post_read_attempts < 32 or (params['rd_tx_reg'] / params['wr_tx_reg'] / 2) < 0.99:
             st = time_ns()
             if i < n_items:  # Writing
                 data = write_list[i:i + n_register_write].tolist()
                 try:
                     if (st - params['wr_dly_st'] * 0) > params['busy_dly_ns']:
                         self.device.write_data(REG_WRITE_ADDR_POT, data)
-                        print(REG_WRITE_ADDR_POT, data)
                         params['wr_err_cnt'] = 0
                         i += n_register_write
                         params['rx_tx_reg'] += n_register_write
@@ -234,6 +232,10 @@ class PotentiostatController:
                     if (st - params['rd_dly_st'] * 0) > params['busy_dly_ns']:
                         rd_data = self.device.read_data(REG_READ_ADDR,
                                                         n_register_read)  # Registernumber, number of decimals
+                        
+                        if i >= n_items and rd_data:
+                            post_read_attempts += 1
+    
 
                         # Data conversion from uint16 to np.float32
                         adc_words = np.array(rd_data).astype(np.uint16)
@@ -250,9 +252,9 @@ class PotentiostatController:
             except minimalmodbus.SlaveReportedException:
                 params['rd_dly_st'] = time_ns()
                 params['rd_err_cnt'] += 1
-            finally:
-                if i >= n_items:
-                    post_read_attempts += 1
+                if params['rd_err_cnt'] > 1:
+                    logger.warning('Reading errors: ' + str(params['rd_err_cnt']))
+                    raise
 
         self._teardown_measurement()
 
