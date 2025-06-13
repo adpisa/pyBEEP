@@ -25,10 +25,10 @@ class PotentiostatController:
         self.last_plot_path = None
         self.device_lock = threading.Lock()
         self._measurement_modes = {
-            "CP": {"type": "pid_active", "waveform_func": constant_waveform},
-            "CA": {"type": "pid_inactive", "waveform_func": constant_waveform},
-            "LSV": {"type": "pid_inactive", "waveform_func": linear_sweep},
-            "CV": {"type": "pid_inactive", "waveform_func": cyclic_voltammetry}
+            "CP": {"pid": True, "waveform_func": constant_waveform},
+            "CA": {"pid": False, "waveform_func": constant_waveform},
+            "LSV": {"pid": False, "waveform_func": linear_sweep},
+            "CV": {"pid": False, "waveform_func": cyclic_voltammetry}
         }
 
     def _setup_measurement(self, tia_gain: int, clear_fifo: bool = False, fifo_start: bool = False):
@@ -60,12 +60,14 @@ class PotentiostatController:
             self.device.send_command(CMD["SET_SWITCH"], 0)
             self.device.send_command(CMD["TEST_STOP"], 1)
 
-    def apply_measurement(self, mode: str, *args, tia_gain, filepath = None, **kwargs):
+    def apply_measurement(self, pid: bool, *args, tia_gain, filepath = None, **kwargs):
         mode_config = self._measurement_modes[mode.upper()]
-        filepath = filepath or default_filepath(mode, *args, tia_gain=tia_gain)
+        filepath = filepath or default_filepath(pid, *args, tia_gain=tia_gain)
 
+        waveform = mode_config["waveform_func"](pid, *args, **kwargs)
+        
         if mode_config['type'] == 'pid_active':
-            waveform = mode_config["waveform_func"](mode, *args, **kwargs)
+            
             self._run_measurement(
                 lambda q: self._read_write_data_pid_active(q, waveform, tia_gain),
                 filepath)
@@ -140,12 +142,13 @@ class PotentiostatController:
             if i < n_items:  # Writing
                 data = write_list[i:i + n_register_write].tolist()
                 try:
-                    if (st - params['wr_dly_st'] * 0) > params['busy_dly_ns']:
+                    if (st - params['wr_dly_st']*0) > params['busy_dly_ns']:
                         self.device.write_data(REG_WRITE_ADDR_PID, [CMD['PID_START']] + data)
                         params['wr_err_cnt'] = 0
-                        i += n_register
-                        params['rx_tx_reg'] += n_register
-                        params['wr_tx_reg'] += n_register
+                        i += n_register_write
+                        params['rx_tx_reg'] += n_register_write
+                        params['wr_tx_reg'] += n_register_write
+                        #print('P1: ', (time_ns() - st)/1000000)
                 except minimalmodbus.SlaveReportedException:
                     params['wr_dly_st'] = time_ns()
                     params['wr_err_cnt'] += 1
@@ -172,8 +175,9 @@ class PotentiostatController:
                 params['rd_dly_st'] = time_ns()
                 params['rd_err_cnt'] += 1
             finally:
-                if i > n_items:
+                if i >= n_items:
                     post_read_attempts += 1
+                #print('P2: ', (time_ns() - st)/1000000)
 
         self._teardown_measurement()
 
@@ -185,6 +189,83 @@ class PotentiostatController:
         logger.debug(f"Send: {params['wr_tx_reg']}, Read: {params['rd_tx_reg']}, Diff: {params['rd_tx_reg'] - params['wr_tx_reg']*2}\n"
                      f"Time/point: {result_tm / params['wr_tx_reg']}\n")
 
+    def _read_write_stream(self,
+                           data_queue: Queue,
+                           pid: bool,
+                           values_list: np.array,
+                           tia_gain: int = 0,
+                           n_register_read: int = 120):
+        params = {'busy_dly_ns': 400e6, 'wr_err_cnt': 0, 'rd_err_cnt': 0, 'wr_dly_st': 0,
+                  'rd_dly_st': 0, 'rx_tx_reg': 0, 'wr_tx_reg': 0, 'rd_tx_reg': 0, 'transmission_st': time_ns()}
+
+        # Generate numpy array to send
+        y_bytes = values_list.tobytes(order='C')
+        write_list = np.frombuffer(y_bytes, np.uint16)
+        print(f"Write list element count {len(write_list)}.\n")
+        n_items = len(write_list)
+        
+        read_address = REG_WRITE_ADDR_PID if pid else REG_WRITE_ADDR_POT
+        n_register_write = 2 if pid else n_register_read
+        self._setup_measurement(tia_gain=tia_gain, clear_fifo=True, fifo_start=(not pid))
+
+        # Send and collect data
+        i = 0
+        params['transmission_st'] = time_ns()
+        post_read_attempts = 0
+        while post_read_attempts < 3:
+            st = time_ns()
+            if i < n_items:  # Writing
+                data = write_list[i:i + n_register_write].tolist()
+                data_to_send = [CMD['PID_START']] + data if pid else data
+                try:
+                    if (st - params['wr_dly_st'] * 0) > params['busy_dly_ns']:
+                        self.device.write_data(read_address, data_to_send)
+                        params['wr_err_cnt'] = 0
+                        i += n_register_write
+                        params['rx_tx_reg'] += n_register_write
+                        params['wr_tx_reg'] += n_register_write
+                except minimalmodbus.SlaveReportedException:
+                    params['wr_dly_st'] = time_ns()
+                    params['wr_err_cnt'] += 1
+            try:
+                # We need read two times for each write time becase adc push two values to FIFO
+                for r in range(0, 2):
+                    if (st - params['rd_dly_st'] * 0) > params['busy_dly_ns']:
+                        rd_data = self.device.read_data(REG_READ_ADDR,
+                                                        n_register_read)  # Registernumber, number of decimals
+
+                        # Data conversion from uint16 to np.float32
+                        adc_words = np.array(rd_data).astype(np.uint16)
+                        adc_bytes = adc_words.tobytes()
+                        rd_list = np.frombuffer(adc_bytes, np.float32)
+                        rd_list = np.reshape(rd_list, (-1, 2))
+
+                        data_queue.put(rd_list)
+                        params['rx_tx_reg'] += n_register
+                        params['rd_tx_reg'] += n_register
+                        params['rd_err_cnt'] = 0
+                    else:
+                        break
+            except minimalmodbus.SlaveReportedException:
+                params['rd_dly_st'] = time_ns()
+                params['rd_err_cnt'] += 1
+            finally:
+                if i >= n_items:
+                    post_read_attempts += 1
+
+        self._teardown_measurement()
+
+        result_tm = (time_ns() - params['transmission_st']) / 1e9
+        data_rate = (2 * params['rx_tx_reg']) / result_tm
+        logger.info(f"\nTotal transmission time {result_tm:3.4} s, data rate {(data_rate / 1000):3.4} KBytes/s.\n")
+        logger.debug(f"Failed writing: {params['wr_err_cnt']}")
+        logger.debug(f"Failed reading: {params['rd_err_cnt']}")
+        logger.debug(
+            f"Send: {params['wr_tx_reg']}, Read: {params['rd_tx_reg']}, Read/Sent/2: {params['rd_tx_reg'] / params['wr_tx_reg'] / 2}\n"
+            f"Time/point: {result_tm / params['wr_tx_reg']}\n")
+        logger.debug(f"Send: {params['wr_tx_reg']}, Read: {params['rd_tx_reg']}")
+        logger.debug(f"Actual points expected to read: {2 * params['wr_tx_reg']}, actual read: {params['rd_tx_reg']}")
+    
     def _read_write_data_pid_inactive(self,
                                      data_queue: Queue,
                                      potentials_list: np.array,

@@ -5,7 +5,7 @@ import threading
 import numpy as np
 
 def default_filepath(
-        mode: str, 
+        pid: bool, 
         value: float, 
         time: float, 
         tia_gain: int,
@@ -25,6 +25,7 @@ def default_filepath(
         str: The full path for the data file.
     """
     stamp = datetime.datetime.now().strftime("%Y%m%d_%Hh%Mm%Ss")
+    mode = 'gal' if pid else 'pot'
     if not folder:
         folder = select_folder()
     return f"{folder}/{stamp}_{mode}_{value}_{time}_tia{tia_gain}.csv"
