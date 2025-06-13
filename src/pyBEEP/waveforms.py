@@ -13,9 +13,9 @@ def linear_sweep(pid: bool, start: float, end: float, scan_rate: float) -> np.nd
     length = int(duration / point_interval)
     return np.linspace(start, end, length, dtype=np.float32)
 
-def cyclic_voltammetry(mode: str, start: float, vertex: float, end: float, scan_rate: float, cycles: int) -> np.ndarray:
+def cyclic_voltammetry(pid: bool, start: float, vertex: float, end: float, scan_rate: float, cycles: int) -> np.ndarray:
     segments = []
     for _ in range(cycles):
-        segments.append(linear_sweep(mode, start, vertex, scan_rate))
-        segments.append(linear_sweep(mode, vertex, end, scan_rate))
+        segments.append(linear_sweep(pid, start, vertex, scan_rate))
+        segments.append(linear_sweep(pid, vertex, end, scan_rate))
     return np.concatenate(segments)

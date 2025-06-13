@@ -60,20 +60,15 @@ class PotentiostatController:
             self.device.send_command(CMD["SET_SWITCH"], 0)
             self.device.send_command(CMD["TEST_STOP"], 1)
 
-    def apply_measurement(self, pid: bool, *args, tia_gain, filepath = None, **kwargs):
+    def apply_measurement(self, mode: str, *args, tia_gain, filepath = None, **kwargs):
         mode_config = self._measurement_modes[mode.upper()]
-        filepath = filepath or default_filepath(pid, *args, tia_gain=tia_gain)
+        filepath = filepath or default_filepath(mode, *args, tia_gain=tia_gain)
 
-        waveform = mode_config["waveform_func"](pid, *args, **kwargs)
+        waveform = mode_config["waveform_func"](mode_config['pid'], *args, **kwargs)
         
-        if mode_config['type'] == 'pid_active':
-            
-            self._run_measurement(
-                lambda q: self._read_write_data_pid_active(q, waveform, tia_gain),
+        self._run_measurement(
+                lambda q: self._read_write_stream(q, mode_config['pid'], waveform, tia_gain),
                 filepath)
-        elif mode_config["type"] == "pid_inactive":
-            waveform = mode_config["waveform_func"](mode, *args, **kwargs)
-            self._run_measurement(lambda q: self._read_write_data_pid_inactive(q,waveform, tia_gain), filepath)
 
         self.last_plot_path = filepath
 
@@ -204,22 +199,28 @@ class PotentiostatController:
         print(f"Write list element count {len(write_list)}.\n")
         n_items = len(write_list)
         
-        read_address = REG_WRITE_ADDR_PID if pid else REG_WRITE_ADDR_POT
+        write_address = REG_WRITE_ADDR_PID if pid else REG_WRITE_ADDR_POT
         n_register_write = 2 if pid else n_register_read
-        self._setup_measurement(tia_gain=tia_gain, clear_fifo=True, fifo_start=(not pid))
+        n_register_write = n_register_read
+        self._setup_measurement(tia_gain=tia_gain, clear_fifo=True, fifo_start=True)
+        
+        if pid:
+            initial_target = write_list[:2]
+            self.device.write_data(REG_WRITE_ADDR_PID, [CMD['PID_START']] + initial_target.tolist())
+            print('PID Activated')
 
         # Send and collect data
         i = 0
         params['transmission_st'] = time_ns()
         post_read_attempts = 0
-        while post_read_attempts < 3:
+        while post_read_attempts < 32:
             st = time_ns()
             if i < n_items:  # Writing
                 data = write_list[i:i + n_register_write].tolist()
-                data_to_send = [CMD['PID_START']] + data if pid else data
                 try:
                     if (st - params['wr_dly_st'] * 0) > params['busy_dly_ns']:
-                        self.device.write_data(read_address, data_to_send)
+                        self.device.write_data(REG_WRITE_ADDR_POT, data)
+                        print(REG_WRITE_ADDR_POT, data)
                         params['wr_err_cnt'] = 0
                         i += n_register_write
                         params['rx_tx_reg'] += n_register_write
@@ -241,8 +242,8 @@ class PotentiostatController:
                         rd_list = np.reshape(rd_list, (-1, 2))
 
                         data_queue.put(rd_list)
-                        params['rx_tx_reg'] += n_register
-                        params['rd_tx_reg'] += n_register
+                        params['rx_tx_reg'] += n_register_read
+                        params['rd_tx_reg'] += n_register_read
                         params['rd_err_cnt'] = 0
                     else:
                         break
